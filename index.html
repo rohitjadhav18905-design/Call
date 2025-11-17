@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Rj — Video Call</title>
+  <style>
+    body{font-family:Inter,Arial,sans-serif;background:#071024;color:#eaf0ff;padding:12px}
+    #videos{display:flex;gap:12px;flex-wrap:wrap}
+    video{width:320px;height:240px;background:#000;border-radius:8px;object-fit:cover}
+    input, button{padding:8px;margin:6px}
+    .controls{margin-bottom:10px}
+    .linkBox{background:#0b1b2a;padding:8px;border-radius:8px;margin-top:6px}
+  </style>
+</head>
+<body>
+  <h2>Rj — Real Video Call</h2>
+  <div class="controls">
+    <label>Signaling URL: <input id="signalUrl" placeholder="ws://localhost:8888" style="width:260px" value="ws://localhost:8888" /></label><br/>
+    <label>Room ID: <input id="room" placeholder="room-id" /></label>
+    <button id="createLink">Create Link</button>
+    <button id="startBtn">Start / Join</button>
+    <button id="hangupBtn" disabled>Hang Up</button>
+    <div class="linkBox" id="linkBox" style="display:none"></div>
+  </div>
+
+  <div id="videos">
+    <div>
+      <h4>Local</h4>
+      <video id="localVideo" autoplay muted playsinline></video>
+    </div>
+    <div>
+      <h4>Remote</h4>
+      <video id="remoteVideo" autoplay playsinline></video>
+    </div>
+  </div>
+
+  <script>
+  function genId(len=6){ const chars='abcdefghijklmnopqrstuvwxyz0123456789'; let s=''; for(let i=0;i<len;i++) s+=chars[Math.floor(Math.random()*chars.length)]; return s; }
+  const createLinkBtn = document.getElementById('createLink');
+  const startBtn = document.getElementById('startBtn');
+  const hangupBtn = document.getElementById('hangupBtn');
+  const roomInput = document.getElementById('room');
+  const signalUrlInput = document.getElementById('signalUrl');
+  const linkBox = document.getElementById('linkBox');
+  const localVideo = document.getElementById('localVideo');
+  const remoteVideo = document.getElementById('remoteVideo');
+
+  let localStream, pc, ws;
+  const pcConfig = { iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] };
+
+  createLinkBtn.onclick = () => {
+    const id = 'rj-' + genId(8);
+    roomInput.value = id;
+    const url = location.origin + location.pathname + '?room=' + id;
+    linkBox.style.display = 'block';
+    linkBox.innerHTML = '<b>Share this link:</b> <a href="' + url + '" target="_blank">' + url + '</a> <button id="copyBtn">Copy</button>';
+    document.getElementById('copyBtn').onclick = () => {
+      navigator.clipboard.writeText(url).then(()=> alert('Link copied'));
+    };
+  };
+
+  startBtn.onclick = async () => {
+    startBtn.disabled = true;
+    const room = roomInput.value.trim();
+    if (!room) return alert('Enter room id or create link');
+    const SIGNALING_URL = signalUrlInput.value.trim();
+
+    try {
+      localStream = await navigator.mediaDevices.getUserMedia({ video: true, audio: true });
+      localVideo.srcObject = localStream;
+    } catch (e) {
+      alert('Camera/mic access denied or not available. ' + e.message);
+      startBtn.disabled = false;
+      return;
+    }
+
+    ws = new WebSocket(SIGNALING_URL);
+    ws.addEventListener('open', () => { ws.send(JSON.stringify({ type: 'join', room })); });
+    ws.addEventListener('message', async (ev) => {
+      const msg = JSON.parse(ev.data);
+      if (msg.type === 'offer') {
+        await ensurePC();
+        await pc.setRemoteDescription(new RTCSessionDescription(msg.payload));
+        const answer = await pc.createAnswer();
+        await pc.setLocalDescription(answer);
+        ws.send(JSON.stringify({ type: 'answer', payload: pc.localDescription, room }));
+      } else if (msg.type === 'answer') {
+        await pc.setRemoteDescription(new RTCSessionDescription(msg.payload));
+      } else if (msg.type === 'candidate') {
+        try { await pc.addIceCandidate(new RTCIceCandidate(msg.payload)); } catch (e) { console.warn(e); }
+      } else if (msg.type === 'peer-joined') {
+        await ensurePC();
+        const offer = await pc.createOffer();
+        await pc.setLocalDescription(offer);
+        ws.send(JSON.stringify({ type: 'offer', payload: pc.localDescription, room }));
+      } else if (msg.type === 'peer-left') {
+        hangUp();
+        alert('Peer left the room');
+      }
+    });
+    ws.addEventListener('close', () => console.log('Signaling closed'));
+    hangupBtn.disabled = false;
+  };
+
+  hangupBtn.onclick = () => { hangUp(); };
+
+  function sendToSignaling(type, payload) {
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      const room = roomInput.value.trim();
+      ws.send(JSON.stringify({ type, room, payload }));
+    }
+  }
+
+  async function ensurePC() {
+    if (pc) return;
+    pc = new RTCPeerConnection(pcConfig);
+    localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+    pc.onicecandidate = (event) => {
+      if (event.candidate) sendToSignaling('candidate', event.candidate);
+    };
+    pc.ontrack = (event) => { remoteVideo.srcObject = event.streams[0]; };
+    pc.onconnectionstatechange = () => {
+      console.log('PC state', pc.connectionState);
+      if (pc.connectionState === 'disconnected' || pc.connectionState === 'failed') hangUp();
+    };
+  }
+
+  function hangUp() {
+    if (pc) { pc.getSenders().forEach(s => { try { pc.removeTrack(s); } catch(e){} }); try { pc.close(); } catch(e){} pc = null; }
+    if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; localVideo.srcObject = null; }
+    if (ws) { try { ws.close(); } catch(e){} ws = null; }
+    remoteVideo.srcObject = null;
+    hangupBtn.disabled = true;
+    startBtn.disabled = false;
+  }
+
+  // Auto-fill room from URL param if present
+
+  (function(){ const params = new URLSearchParams(location.search); if (params.get('room')) roomInput.value = params.get('room'); })();
+  </script>
+</body>
+</html>
